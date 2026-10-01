@@ -48,7 +48,7 @@ tilt → body rate → angular acceleration → torque
 
 | | |
 |---|---|
-| Frame | 163 mm, 5-inch tri-blade props, 2 CW / 2 CCW |
+| Frame | 163 mm side-to-side, 2.5-inch props (R = 63.5 mm), 2 CW / 2 CCW |
 | Power | 1300 mAh 4S LiPo → XT60 → distribution → 4× ESC, buck to 5 V for the ESP32 |
 | Compute | ESP32 devkit, flight controller and estimator on-board |
 | ESCs | Bidirectional DShot with RPM telemetry (Bluejay) |
