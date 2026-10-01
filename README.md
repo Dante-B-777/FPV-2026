@@ -1,6 +1,6 @@
 # FPV 2026 — Quadrotor Flight Controller
 
-A 163 mm (2.5-inch) quadrotor and its flight controller, both built from scratch
+A 232 mm quadrotor and its flight controller, both built from scratch
 over the summer of 2026 on a single ESP32. Control runs on **per-rotor angular
 velocity**, closed on RPM fed back over bidirectional DShot, with state supplied
 by a 9-state error-state Kalman filter.
@@ -48,7 +48,7 @@ tilt → body rate → angular acceleration → torque
 
 | | |
 |---|---|
-| Frame | 163 mm side-to-side, 2.5-inch props (R = 63.5 mm), 2 CW / 2 CCW |
+| Frame | 232 mm diagonal (163 mm side-to-side), 5-inch tri-blade props (R = 63.5 mm), 2 CW / 2 CCW |
 | Power | 1300 mAh 4S LiPo → XT60 → distribution → 4× ESC, buck to 5 V for the ESP32 |
 | Compute | ESP32 devkit, flight controller and estimator on-board |
 | ESCs | Bidirectional DShot with RPM telemetry (Bluejay) |
