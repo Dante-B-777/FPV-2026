@@ -1,0 +1,36 @@
+ROBUST XY REPAIR PACKAGE - VALIDATION REPORT
+Generated: 2026-08-10
+
+COMPLETED CHECKS
+----------------
+PASS  Reproduced latest-log telemetry summary with analyze_telemetry.py.
+PASS  Main sketch include names resolve inside Receiver_Robust_XY/.
+PASS  Balanced braces, parentheses, and brackets after stripping comments and
+      string/character literals for every supplied .ino/.h/.cpp file.
+PASS  Host C++17 syntax check for Eskf9_Robust_XY.h, MotionModelFF.h, and
+      RotorFeedbackModel.h.
+PASS  Main and ESKF patches regenerated against the exact uploaded source with
+      CRLF normalized before diffing.
+PASS  XY commissioning defaults OFF.
+PASS  Magnetic yaw fusion and heading hold default OFF in the robust build.
+PASS  Runtime flowmap change forces XY commissioning OFF.
+PASS  Flow acceptance requires full-burst plausibility, motion 0xB0, nonzero
+      SQUAL, nonzero shutter, valid timing/range, physical speed limit, and
+      both ESKF velocity axes accepted.
+PASS  XY arming requires ramp complete, altitude hold active, valid-flow dwell,
+      stable vertical/horizontal speed, low yaw rate, and low tilt.
+
+NOT COMPLETED / MUST BE DONE ON THE USER'S SYSTEM
+-------------------------------------------------
+NOT RUN  Arduino IDE or arduino-cli build against the exact installed
+         Arduino-ESP32 core, board package, and external sensor libraries.
+NOT RUN  PMW3901 full-burst transfer on the physical SPI bus.
+NOT RUN  Physical axis-map, scale, or gyro-compensation sign verification.
+NOT RUN  Motor-mixer/yaw-torque verification.
+NOT RUN  Propeller-off motor vibration test.
+NOT RUN  Restrained/tethered flight test.
+NOT RUN  Free flight.
+
+A successful static check is not evidence that the physical sensor transform or
+controller signs are correct. Keep xycommission OFF until the bench diagnostic
+passes on the assembled drone.

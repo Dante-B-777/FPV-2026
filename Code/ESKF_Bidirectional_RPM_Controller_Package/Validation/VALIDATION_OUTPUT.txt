@@ -1,0 +1,14 @@
+stationary p=(0.0000000 0.0000000 0.0000000) v=(0.0000000 0.0000000 0.0000000) healthy=1
+tilt est pitchX=8.000 deg rollY=-0.000 yaw=0.000
+flow p=(0.997 0.000) v=(0.501 0.000)
+ESKF tests passed
+pitch onset front=-24.000 rear=24.000 rate=40.271
+roll onset left=-24.000 right=24.000 rate=40.271
+settled collective=0.964 differentials=[0.000 0.000 0.000 0.000]
+Motion model tests passed
+mode 0 controller roll 10.000 controller pitch -0.000
+mode 1 controller roll -0.000 controller pitch 10.000
+Controller/ESKF sign tests passed
+rotor feedback Fz=5.672 N scale0=1.9151 omega0=980.18 fallback0=978.54
+Rotor feedback tests passed
+All host validation checks passed.

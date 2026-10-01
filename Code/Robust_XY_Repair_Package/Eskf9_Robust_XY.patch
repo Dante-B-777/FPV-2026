@@ -1,0 +1,82 @@
+--- Eskf9_original.h
++++ Eskf9_Robust_XY.h
+@@ -810,6 +810,79 @@
+   }
+ 
+ 
++
++  // ==============================================================
++  // BODY X/Y VELOCITY UPDATE -- TRANSLATION ONLY
++  // ==============================================================
++  //
++  // Commissioning-safe optical-flow update used by the robust XY build.
++  // The measurement still observes navigation-frame velocity through
++  // v_B = R_NB^T v_N, but it deliberately does not use an attitude-error
++  // Jacobian. This prevents an unverified PMW axis/sign/scale from changing
++  // the quaternion. The returned bit mask reports which scalar axes passed
++  // their innovation gates: bit0=X, bit1=Y.
++  //
++  // ==============================================================
++
++  uint8_t updateBodyVelocityVelocityOnly(
++    float bodyVelocityX,
++    float bodyVelocityY,
++    float standardDeviationX,
++    float standardDeviationY,
++    float gateSigma = 6.0f
++  )
++  {
++    if (
++      !isfinite(bodyVelocityX) ||
++      !isfinite(bodyVelocityY) ||
++      !isfinite(standardDeviationX) ||
++      !isfinite(standardDeviationY) ||
++      standardDeviationX <= 0.0f ||
++      standardDeviationY <= 0.0f
++    )
++    {
++      return 0U;
++    }
++
++    uint8_t acceptedMask = 0U;
++
++    for (int measuredAxis = 0; measuredAxis < 2; ++measuredAxis)
++    {
++      float velocityBody[3] = {};
++      getBodyVelocity(velocityBody);
++
++      float H[STATE_DIM] = {};
++
++      // h = e_i^T R_NB^T v_N. Only velocity-error states participate.
++      for (int navAxis = 0; navAxis < 3; ++navAxis)
++      {
++        H[3 + navAxis] = rotation_[navAxis][measuredAxis];
++      }
++
++      const float measurement = measuredAxis == 0
++        ? bodyVelocityX
++        : bodyVelocityY;
++
++      const float standardDeviation = measuredAxis == 0
++        ? standardDeviationX
++        : standardDeviationY;
++
++      const bool accepted = scalarUpdate(
++        H,
++        measurement - velocityBody[measuredAxis],
++        square(standardDeviation),
++        gateSigma
++      );
++
++      if (accepted)
++      {
++        acceptedMask |= static_cast<uint8_t>(1U << measuredAxis);
++      }
++    }
++
++    return acceptedMask;
++  }
++
+   // ==============================================================
+   // GRAVITY-DIRECTION ATTITUDE UPDATE
+   // ==============================================================

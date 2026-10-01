@@ -1,0 +1,877 @@
+--- Pasted_text_2_5_original.ino
++++ ESKF_Drone_Controller_Robust_XY.ino
+@@ -132,11 +132,11 @@
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/queue.h>
+ #include <freertos/task.h>
+-#include "Eskf9.h"
++#include "Eskf9_Robust_XY.h"
+ #include "MotionModelFF.h"
+ #include "RotorFeedbackModel.h"
+ #include "BidirectionalDShot.h"
+-#include "OpticalFlowAsync.h"
++#include "OpticalFlowAsync_Robust.h"
+ #include "AsyncDebugTelemetry.h"
+ 
+ // ================================================================
+@@ -293,10 +293,11 @@
+ bool magReferenceValid = false;
+ bool magReferencePending = true;
+ 
+-// Full-hover integration mode. Magnetic yaw fusion is available from startup
+-// so the ESKF has a settled heading before arming. Yaw heading hold itself is
+-// deliberately armed only when the enable ramp completes.
+-static constexpr bool FULL_HOVER_INTEGRATION = true;
++// Commissioning-safe default. Magnetic yaw fusion and heading hold remain
++// OFF at boot so yaw problems cannot contaminate optical-flow mapping or X/Y
++// controller tests. After the compass and yaw mixer are independently proven,
++// enable them explicitly with the stopped-airframe serial commands.
++static constexpr bool FULL_HOVER_INTEGRATION = false;
+ bool magYawFusionEnabled = FULL_HOVER_INTEGRATION;
+ bool yawHeadingHoldEnabled = false;
+ 
+@@ -499,34 +500,53 @@
+ static constexpr uint8_t FLOW_CS_PIN = 13;
+ static constexpr uint8_t FLOW_RST_PIN = 33;
+ 
+-static constexpr int8_t FLOW_X_DIRECTION = +1;
+-static constexpr int8_t FLOW_Y_DIRECTION = -1;
+-
+ static constexpr float PI_F = 3.14159265358979323846f;
+ static constexpr float DEG_TO_RAD_F = PI_F / 180.0f;
+ static constexpr float RAD_TO_DEG_F = 180.0f / PI_F;
+ 
+-static constexpr float FLOW_EFFECTIVE_COUNTS = 30.0f;
+-static constexpr float FLOW_APERTURE_RAD = 4.2f * DEG_TO_RAD_F;
+-static constexpr float FLOW_RAD_PER_COUNT =
+-  FLOW_APERTURE_RAD / FLOW_EFFECTIVE_COUNTS;
+-
++// PX4's PMW3901 driver uses 1/385 rad/count. The bench diagnostic can be
++// used to calibrate this value for the actual lens, height, and floor.
++static constexpr float FLOW_RAD_PER_COUNT = 1.0f / 385.0f;
+ static constexpr float FLOW_SCALE_X = 1.0f;
+ static constexpr float FLOW_SCALE_Y = 1.0f;
+-static constexpr float FLOW_VELOCITY_FILTER_ALPHA = 0.15f;  // smoother at 100 Hz
+-static constexpr float FLOW_INVALID_DECAY = 0.92f;          // slower decay at 100 Hz
++static constexpr float FLOW_VELOCITY_FILTER_ALPHA = 0.25f;
++static constexpr float FLOW_INVALID_DECAY = 0.85f;
++static constexpr uint32_t FLOW_SPI_HZ = 2000000UL;
+ 
+-static constexpr float MIN_FLOW_RANGE_M = 0.080f;
++static constexpr float MIN_FLOW_RANGE_M = 0.100f;
+ static constexpr float MAX_FLOW_RANGE_M = 2.000f;
+ static constexpr int32_t FLOW_OUTLIER_LIMIT_COUNTS = 100;
++static constexpr float MAX_PLAUSIBLE_FLOW_SPEED_MPS = 3.0f;
++static constexpr uint8_t MIN_FLOW_SQUAL = 1;
+ 
+ static constexpr float PMW_OFFSET_X_M = 0.00f;
+ static constexpr float PMW_OFFSET_Y_M = 0.04f;
+ 
+ /*
+-  Rotational-flow compensation signs for this body convention.
+-  These are isolated constants so they can be reversed independently if a
+-  propeller-off hand-rotation test shows the compensation direction is wrong.
++  FLOW AXIS MAPPING MUST BE MEASURED ON THIS AIRFRAME.
++
++  Use PMW3901_Flow_Bench_Diagnostic.ino and set flowAxisMap to the mode that
++  gives +body X for a physical move to the aircraft right and +body Y for a
++  physical move forward. Mode 1 is the old controller mapping. Mode 7 is the
++  mapping used by the Bitcraze/Espressif flow-deck code.
++*/
++enum class FlowAxisMap : uint8_t
++{
++  PlusXPlusY = 0,
++  PlusXMinusY = 1,
++  MinusXPlusY = 2,
++  MinusXMinusY = 3,
++  PlusYPlusX = 4,
++  PlusYMinusX = 5,
++  MinusYPlusX = 6,
++  MinusYMinusX = 7
++};
++
++FlowAxisMap flowAxisMap = FlowAxisMap::PlusXMinusY;
++
++/*
++  Rotational-flow compensation signs are kept isolated. They must pass the
++  propeller-off rotate-in-place test before XY hold is commissioned.
+ */
+ static constexpr bool ENABLE_FLOW_GYRO_COMPENSATION = true;
+ static constexpr float FLOW_ROLL_COMP_SIGN = +1.0f;
+@@ -534,6 +554,19 @@
+ 
+ Bitcraze_PMW3901 flow(FLOW_CS_PIN);
+ 
++uint8_t lastFlowMotion = 0;
++uint8_t lastFlowSqual = 0;
++uint16_t lastFlowShutter = 0;
++uint8_t lastFlowAxisAcceptedMask = 0;
++float lastInstantFlowVelocityX_mps = 0.0f;
++float lastInstantFlowVelocityY_mps = 0.0f;
++uint32_t flowInvalidTimingCount = 0;
++uint32_t flowInvalidCountCount = 0;
++uint32_t flowInvalidHeightCount = 0;
++uint32_t flowInvalidQualityCount = 0;
++uint32_t flowInvalidSpeedCount = 0;
++uint32_t flowEstimatorRejectCount = 0;
++
+ // ================================================================
+ // VL53L0X CONFIGURATION
+ // ================================================================
+@@ -574,22 +607,40 @@
+ // X/Y POSITION AND VELOCITY CONTROLLER
+ // ================================================================
+ 
+-static constexpr float XY_HOLD_ACTIVATION_RANGE_M = 0.20f;
+-static constexpr uint8_t FLOW_RECOVERY_SAMPLES = 10;
+-static constexpr uint32_t FLOW_LOSS_DISABLE_MS = 250;
+-static constexpr uint32_t XY_HOLD_BLEND_MS = 300;
++static constexpr float XY_HOLD_ACTIVATION_RANGE_M = 0.30f;
++static constexpr uint8_t FLOW_RECOVERY_SAMPLES = 50; // 0.5 s at 100 Hz
++static constexpr uint32_t FLOW_LOSS_DISABLE_MS = 150;
++static constexpr uint32_t XY_HOLD_BLEND_MS = 400;
++static constexpr uint32_t XY_ARM_STABLE_DWELL_MS = 1000;
+ static constexpr float MAX_POSITION_TARGET_ERROR_M = 0.50f;
+-static constexpr float XY_POSITION_DEADBAND_M = 0.03f;
+-static constexpr float MAX_XY_CONTROLLER_ANGLE_DEG = 3.0f;
+-static constexpr float MAX_CONTROLLER_VELOCITY_MPS = 1.00f;
+-static constexpr float MAX_XY_ACCEL_ASSIST_ANGLE_DEG = 4.0f;
+-static constexpr float XY_COMMAND_FILTER_TAU_S = 0.10f;
+-
+-// Stronger X/Y hold gains. The accelerometer term acts only as fast damping;
+-// optical flow remains the long-term velocity and position reference.
+-float xyPositionKp = 0.10f;     // (m/s) per meter of position error
+-float xyVelocityKp = 4.00f;     // degrees per (m/s) of velocity error
+-float xyAccelerationKp = 0.00f; // degrees per (m/s^2), centered sticks only
++static constexpr float XY_POSITION_DEADBAND_M = 0.02f;
++static constexpr float MAX_XY_CONTROLLER_ANGLE_DEG = 5.0f;
++static constexpr float MAX_CONTROLLER_VELOCITY_MPS = 0.35f;
++static constexpr float MAX_XY_ACCELERATION_MPS2 = 0.80f;
++static constexpr float MAX_XY_ACCEL_ASSIST_ANGLE_DEG = 2.0f;
++static constexpr float XY_COMMAND_FILTER_TAU_S = 0.12f;
++static constexpr float XY_ANGLE_SLEW_RATE_DPS = 30.0f;
++
++static constexpr float XY_ARM_MAX_VERTICAL_SPEED_MPS = 0.12f;
++static constexpr float XY_ARM_MAX_HORIZONTAL_SPEED_MPS = 0.20f;
++static constexpr float XY_ARM_MAX_YAW_RATE_DPS = 8.0f;
++static constexpr float XY_ARM_MAX_TILT_DEG = 6.0f;
++static constexpr float XY_ABORT_MAX_VERTICAL_SPEED_MPS = 0.40f;
++static constexpr float XY_ABORT_MAX_YAW_RATE_DPS = 25.0f;
++static constexpr float XY_ABORT_MAX_TILT_DEG = 15.0f;
++
++// Safety interlock. Leave false until the bench diagnostic proves the PMW
++// axis map, scale, quality, and gyro-compensation signs. It can then be
++// enabled while stopped with the serial command: xycommission on
++bool xyHoldCommissioned = false;
++uint32_t xyArmStableStartMs = 0;
++
++// Cascaded controller gains in physical units.
++//   position error [m] * xyPositionKp [1/s] -> velocity target [m/s]
++//   velocity error [m/s] * xyVelocityKp [1/s] -> acceleration target [m/s^2]
++float xyPositionKp = 0.60f;
++float xyVelocityKp = 1.50f;
++float xyAccelerationKp = 0.00f; // optional IMU assist; keep zero initially
+ 
+ float filteredHoldRollAngleDeg = 0.0f;
+ float filteredHoldPitchAngleDeg = 0.0f;
+@@ -1386,6 +1437,7 @@
+ void deactivateXYHold()
+ {
+   xyHoldActive = false;
++  xyArmStableStartMs = 0;
+   targetNavX_m = positionNavX_m;
+   targetNavY_m = positionNavY_m;
+   controllerBodyVelocityTargetX_mps = 0.0f;
+@@ -2863,6 +2915,90 @@
+   flow.readMotionCount(&ignoredX, &ignoredY);
+ }
+ 
++static int16_t makeFlowSigned16(uint8_t lowByte, uint8_t highByte)
++{
++  return static_cast<int16_t>(
++    static_cast<uint16_t>(lowByte) |
++    (static_cast<uint16_t>(highByte) << 8U)
++  );
++}
++
++bool readPmwMotionBurst(OpticalFlowRawSample &sample)
++{
++  uint8_t raw[12] = {};
++
++  SPI.beginTransaction(SPISettings(FLOW_SPI_HZ, MSBFIRST, SPI_MODE3));
++  digitalWrite(FLOW_CS_PIN, LOW);
++  delayMicroseconds(50);
++  SPI.transfer(0x16U); // PMW3901 Motion_Burst register
++  delayMicroseconds(50);
++
++  for (size_t i = 0; i < sizeof(raw); ++i)
++  {
++    raw[i] = SPI.transfer(0x00U);
++  }
++
++  delayMicroseconds(50);
++  digitalWrite(FLOW_CS_PIN, HIGH);
++  SPI.endTransaction();
++  delayMicroseconds(50);
++
++  sample.motion = raw[0];
++  sample.observation = raw[1];
++  sample.rawDeltaX = makeFlowSigned16(raw[2], raw[3]);
++  sample.rawDeltaY = makeFlowSigned16(raw[4], raw[5]);
++  sample.squal = raw[6];
++  sample.rawDataSum = raw[7];
++  sample.maxRawData = raw[8];
++  sample.minRawData = raw[9];
++  sample.shutter = static_cast<uint16_t>(
++    (static_cast<uint16_t>(raw[10]) << 8U) |
++    static_cast<uint16_t>(raw[11])
++  );
++
++  bool allZero = true;
++  bool allOnes = true;
++  for (uint8_t value : raw)
++  {
++    allZero = allZero && value == 0x00U;
++    allOnes = allOnes && value == 0xFFU;
++  }
++
++  sample.transferPlausible = !allZero && !allOnes &&
++    abs(static_cast<int>(sample.rawDeltaX)) <= 1000 &&
++    abs(static_cast<int>(sample.rawDeltaY)) <= 1000;
++
++  return sample.transferPlausible;
++}
++
++void mapFlowCountsToBody(
++  int16_t rawX,
++  int16_t rawY,
++  float &bodyXCounts,
++  float &bodyYCounts
++)
++{
++  switch (flowAxisMap)
++  {
++    case FlowAxisMap::PlusXPlusY:
++      bodyXCounts = +rawX; bodyYCounts = +rawY; break;
++    case FlowAxisMap::PlusXMinusY:
++      bodyXCounts = +rawX; bodyYCounts = -rawY; break;
++    case FlowAxisMap::MinusXPlusY:
++      bodyXCounts = -rawX; bodyYCounts = +rawY; break;
++    case FlowAxisMap::MinusXMinusY:
++      bodyXCounts = -rawX; bodyYCounts = -rawY; break;
++    case FlowAxisMap::PlusYPlusX:
++      bodyXCounts = +rawY; bodyYCounts = +rawX; break;
++    case FlowAxisMap::PlusYMinusX:
++      bodyXCounts = +rawY; bodyYCounts = -rawX; break;
++    case FlowAxisMap::MinusYPlusX:
++      bodyXCounts = -rawY; bodyYCounts = +rawX; break;
++    case FlowAxisMap::MinusYMinusX:
++      bodyXCounts = -rawY; bodyYCounts = -rawX; break;
++  }
++}
++
+ void opticalFlowTaskEntry(void *parameter)
+ {
+   (void)parameter;
+@@ -2883,7 +3019,7 @@
+     const uint32_t ioStartUs = micros();
+ 
+     OpticalFlowRawSample sample;
+-    flow.readMotionCount(&sample.rawDeltaX, &sample.rawDeltaY);
++    readPmwMotionBurst(sample);
+ 
+     // Preserve the original compensation timing: snapshot/reset integrated
+     // gyro angle immediately AFTER readMotionCount() completes.
+@@ -2915,6 +3051,13 @@
+       opticalFlowTaskStats.intervalTotalUs += sample.intervalUs;
+       opticalFlowTaskStats.intervalSamples++;
+     }
++    if (sample.transferPlausible) opticalFlowTaskStats.plausibleTransfers++;
++    if (sample.motion == 0xB0U) opticalFlowTaskStats.motionB0Samples++;
++    opticalFlowTaskStats.squalTotal += sample.squal;
++    if (sample.shutter > opticalFlowTaskStats.maximumShutter)
++    {
++      opticalFlowTaskStats.maximumShutter = sample.shutter;
++    }
+     portEXIT_CRITICAL(&flowTaskStatsMux);
+ 
+     // One-slot latest-value queue: the PMW task never waits for Core 1. If
+@@ -2972,35 +3115,50 @@
+   const float flowDt =
+     static_cast<float>(sample.intervalUs) * 1.0e-6f;
+ 
+-  const int32_t deltaXCounts =
+-    FLOW_X_DIRECTION * static_cast<int32_t>(sample.rawDeltaX);
+-
+-  const int32_t deltaYCounts =
+-    FLOW_Y_DIRECTION * static_cast<int32_t>(sample.rawDeltaY);
+-
+-  const float rollDeltaRad = sample.rollDeltaRad;
+-  const float pitchDeltaRad = sample.pitchDeltaRad;
+-  const float yawDeltaCwRad = sample.yawDeltaCwRad;
++  lastFlowMotion = sample.motion;
++  lastFlowSqual = sample.squal;
++  lastFlowShutter = sample.shutter;
++  lastFlowAxisAcceptedMask = 0;
++
++  float bodyXCounts = 0.0f;
++  float bodyYCounts = 0.0f;
++  mapFlowCountsToBody(
++    sample.rawDeltaX,
++    sample.rawDeltaY,
++    bodyXCounts,
++    bodyYCounts
++  );
+ 
+   const bool timingValid = flowDt >= 0.006f && flowDt <= 0.030f;
+   const bool countsValid =
+-    deltaXCounts > -FLOW_OUTLIER_LIMIT_COUNTS &&
+-    deltaXCounts <  FLOW_OUTLIER_LIMIT_COUNTS &&
+-    deltaYCounts > -FLOW_OUTLIER_LIMIT_COUNTS &&
+-    deltaYCounts <  FLOW_OUTLIER_LIMIT_COUNTS;
++    fabsf(bodyXCounts) < static_cast<float>(FLOW_OUTLIER_LIMIT_COUNTS) &&
++    fabsf(bodyYCounts) < static_cast<float>(FLOW_OUTLIER_LIMIT_COUNTS);
+ 
+   const bool heightValid =
+     rangeControlUsable(nowMs) &&
+     filteredRangeMeters >= MIN_FLOW_RANGE_M &&
+     filteredRangeMeters <= MAX_FLOW_RANGE_M;
+ 
+-  const bool sampleValid = timingValid && countsValid && heightValid;
+-  lastFlowSampleValid = sampleValid;
++  // Bitcraze and Espressif only enqueue flow when the PMW burst reports 0xB0.
++  // SQUAL=0 is also rejected, as in PX4's PMW3901 driver.
++  const bool qualityValid =
++    sample.transferPlausible &&
++    sample.motion == 0xB0U &&
++    sample.squal >= MIN_FLOW_SQUAL &&
++    sample.shutter > 0U;
++
++  if (!timingValid) flowInvalidTimingCount++;
++  if (!countsValid) flowInvalidCountCount++;
++  if (!heightValid) flowInvalidHeightCount++;
++  if (!qualityValid) flowInvalidQualityCount++;
+ 
+-  if (!sampleValid)
++  const bool geometryValid =
++    timingValid && countsValid && heightValid && qualityValid;
++
++  if (!geometryValid)
+   {
++    lastFlowSampleValid = false;
+     consecutiveValidFlowSamples = 0;
+-
+     measuredBodyVelocityX_mps *= FLOW_INVALID_DECAY;
+     measuredBodyVelocityY_mps *= FLOW_INVALID_DECAY;
+ 
+@@ -3016,39 +3174,49 @@
+         nowMs
+       );
+     }
+-
+     return;
+   }
+ 
+   float deltaBodyX_m =
+-    static_cast<float>(deltaXCounts) *
+-    FLOW_RAD_PER_COUNT *
+-    filteredRangeMeters *
+-    FLOW_SCALE_X;
++    bodyXCounts * FLOW_RAD_PER_COUNT * filteredRangeMeters * FLOW_SCALE_X;
+ 
+   float deltaBodyY_m =
+-    static_cast<float>(deltaYCounts) *
+-    FLOW_RAD_PER_COUNT *
+-    filteredRangeMeters *
+-    FLOW_SCALE_Y;
++    bodyYCounts * FLOW_RAD_PER_COUNT * filteredRangeMeters * FLOW_SCALE_Y;
+ 
+   if (ENABLE_FLOW_GYRO_COMPENSATION)
+   {
+-    // Remove apparent floor motion created by roll/pitch camera rotation.
+-    deltaBodyX_m +=
+-      FLOW_ROLL_COMP_SIGN * filteredRangeMeters * rollDeltaRad;
+-
+-    deltaBodyY_m +=
+-      FLOW_PITCH_COMP_SIGN * filteredRangeMeters * pitchDeltaRad;
++    deltaBodyX_m += FLOW_ROLL_COMP_SIGN *
++      filteredRangeMeters * sample.rollDeltaRad;
++
++    deltaBodyY_m += FLOW_PITCH_COMP_SIGN *
++      filteredRangeMeters * sample.pitchDeltaRad;
+   }
+ 
+-  // Remove rigid-body velocity at the PMW sensor caused by its lever arm.
+-  // Positive yawDeltaCwRad is clockwise viewed from above.
+-  deltaBodyX_m -= PMW_OFFSET_Y_M * yawDeltaCwRad;
+-  deltaBodyY_m += PMW_OFFSET_X_M * yawDeltaCwRad;
++  // omega x r correction for the PMW sensor position.
++  deltaBodyX_m -= PMW_OFFSET_Y_M * sample.yawDeltaCwRad;
++  deltaBodyY_m += PMW_OFFSET_X_M * sample.yawDeltaCwRad;
+ 
+   const float instantBodyVelocityX = deltaBodyX_m / flowDt;
+   const float instantBodyVelocityY = deltaBodyY_m / flowDt;
++  lastInstantFlowVelocityX_mps = instantBodyVelocityX;
++  lastInstantFlowVelocityY_mps = instantBodyVelocityY;
++
++  const float speedSquared =
++    instantBodyVelocityX * instantBodyVelocityX +
++    instantBodyVelocityY * instantBodyVelocityY;
++
++  if (
++    !isfinite(instantBodyVelocityX) ||
++    !isfinite(instantBodyVelocityY) ||
++    speedSquared >
++      MAX_PLAUSIBLE_FLOW_SPEED_MPS * MAX_PLAUSIBLE_FLOW_SPEED_MPS
++  )
++  {
++    lastFlowSampleValid = false;
++    consecutiveValidFlowSamples = 0;
++    flowInvalidSpeedCount++;
++    return;
++  }
+ 
+   measuredBodyVelocityX_mps +=
+     FLOW_VELOCITY_FILTER_ALPHA *
+@@ -3058,29 +3226,33 @@
+     FLOW_VELOCITY_FILTER_ALPHA *
+     (instantBodyVelocityY - measuredBodyVelocityY_mps);
+ 
+-  const float flowNoiseScale = 1.0f + 0.015f * fmaxf(
+-    fabsf(measuredRollAngleDeg),
+-    fabsf(measuredPitchAngleDeg)
++  // Crazyflie/Espressif adapt pixel standard deviation from shutter. Convert
++  // that pixel/count uncertainty into m/s for this estimator interface.
++  const float pixelStd = fmaxf(
++    0.10f,
++    0.0007984f * static_cast<float>(sample.shutter) + 0.4335f
+   );
+ 
+   const float flowVelocityStd = clampFloat(
+-    ESKF_FLOW_VELOCITY_STD_MPS * flowNoiseScale,
+-    ESKF_FLOW_VELOCITY_STD_MPS,
+-    0.35f
++    pixelStd * FLOW_RAD_PER_COUNT * filteredRangeMeters / flowDt,
++    0.04f,
++    0.50f
+   );
+ 
+-  // IMPORTANT: the ESKF remains Core-1-owned. Only this short measurement
+-  // correction happens on the flight core; the long PMW SPI transaction has
+-  // already completed independently on the opposite core.
+-  const bool estimatorAcceptedFlow = stateEstimator.updateBodyVelocity(
+-    measuredBodyVelocityX_mps,
+-    measuredBodyVelocityY_mps,
+-    flowVelocityStd,
+-    flowVelocityStd
+-  );
++  // Commissioning-safe update: flow corrects translational velocity only.
++  // It does not alter the quaternion/attitude state. Both X and Y must pass
++  // their innovation gates before a sample can keep XY hold alive.
++  lastFlowAxisAcceptedMask =
++    stateEstimator.updateBodyVelocityVelocityOnly(
++      measuredBodyVelocityX_mps,
++      measuredBodyVelocityY_mps,
++      flowVelocityStd,
++      flowVelocityStd
++    );
+ 
+-  if (estimatorAcceptedFlow)
++  if (lastFlowAxisAcceptedMask == 0x03U)
+   {
++    lastFlowSampleValid = true;
+     eskfFlowVelocityReady = true;
+     fusedVelocityInitialized = true;
+     synchronizeEstimatorState();
+@@ -3093,10 +3265,9 @@
+   }
+   else
+   {
+-    // A geometrically valid PMW sample that fails the Kalman innovation gate
+-    // is still an estimator outlier and must not keep XY hold alive.
+     lastFlowSampleValid = false;
+     consecutiveValidFlowSamples = 0;
++    flowEstimatorRejectCount++;
+   }
+ }
+ 
+@@ -3207,7 +3378,6 @@
+   commandedBodyVelocityY_mps =
+     correctedPitchStick * MAX_FORWARD_VELOCITY_MPS;
+ 
+-  // Original direct-angle behavior, retained as fallback and blend source.
+   const float manualRollAngleDeg =
+     -correctedRollStick * MAX_ROLL_ANGLE_DEG;
+ 
+@@ -3217,30 +3387,65 @@
+   const bool flowRecovered =
+     consecutiveValidFlowSamples >= FLOW_RECOVERY_SAMPLES;
+ 
+-  if (
++  const float horizontalSpeedMps = sqrtf(
++    measuredBodyVelocityX_mps * measuredBodyVelocityX_mps +
++    measuredBodyVelocityY_mps * measuredBodyVelocityY_mps
++  );
++
++  const bool armConditionsStable =
++    xyHoldCommissioned &&
+     flightEnabled &&
++    !enableRampActive &&
+     !disableRampActive &&
+-    !xyHoldActive &&
++    altitudeHoldActive &&
+     flowRecovered &&
++    lastFlowSampleValid &&
++    lastFlowAxisAcceptedMask == 0x03U &&
+     eskfStateHealthy &&
+     eskfFlowVelocityReady &&
+     rangeControlUsable(nowMs) &&
+-    filteredRangeMeters >= XY_HOLD_ACTIVATION_RANGE_M
+-  )
++    filteredRangeMeters >= XY_HOLD_ACTIVATION_RANGE_M &&
++    fabsf(verticalVelocityMps) <= XY_ARM_MAX_VERTICAL_SPEED_MPS &&
++    horizontalSpeedMps <= XY_ARM_MAX_HORIZONTAL_SPEED_MPS &&
++    fabsf(measuredYawRateDps) <= XY_ARM_MAX_YAW_RATE_DPS &&
++    fabsf(measuredRollAngleDeg) <= XY_ARM_MAX_TILT_DEG &&
++    fabsf(measuredPitchAngleDeg) <= XY_ARM_MAX_TILT_DEG;
++
++  if (!xyHoldActive)
+   {
+-    activateXYHold(nowMs);
++    if (armConditionsStable)
++    {
++      if (xyArmStableStartMs == 0U)
++      {
++        xyArmStableStartMs = nowMs;
++      }
++      else if (
++        static_cast<uint32_t>(nowMs - xyArmStableStartMs) >=
++          XY_ARM_STABLE_DWELL_MS
++      )
++      {
++        activateXYHold(nowMs);
++      }
++    }
++    else
++    {
++      xyArmStableStartMs = 0U;
++    }
+   }
+ 
+-  if (
+-    xyHoldActive &&
+-    (
+-      !rangeControlUsable(nowMs) ||
+-      !eskfStateHealthy ||
+-      !eskfFlowVelocityReady ||
+-      static_cast<uint32_t>(nowMs - lastValidFlowMs) >
+-        FLOW_LOSS_DISABLE_MS
+-    )
+-  )
++  const bool abortConditions =
++    !xyHoldCommissioned ||
++    !rangeControlUsable(nowMs) ||
++    !eskfStateHealthy ||
++    !eskfFlowVelocityReady ||
++    static_cast<uint32_t>(nowMs - lastValidFlowMs) >
++      FLOW_LOSS_DISABLE_MS ||
++    fabsf(verticalVelocityMps) > XY_ABORT_MAX_VERTICAL_SPEED_MPS ||
++    fabsf(measuredYawRateDps) > XY_ABORT_MAX_YAW_RATE_DPS ||
++    fabsf(measuredRollAngleDeg) > XY_ABORT_MAX_TILT_DEG ||
++    fabsf(measuredPitchAngleDeg) > XY_ABORT_MAX_TILT_DEG;
++
++  if (xyHoldActive && abortConditions)
+   {
+     deactivateXYHold();
+   }
+@@ -3267,19 +3472,14 @@
+   targetNavX_m += commandedNavVelocityX * dt;
+   targetNavY_m += commandedNavVelocityY * dt;
+ 
+-  // Keep the stored target fixed. Limit only the error used by the
+-  // controller so a large displacement cannot demand an unsafe velocity.
+-  const float rawPositionErrorX = targetNavX_m - positionNavX_m;
+-  const float rawPositionErrorY = targetNavY_m - positionNavY_m;
+-
+   const float limitedPositionErrorX = clampFloat(
+-    rawPositionErrorX,
++    targetNavX_m - positionNavX_m,
+     -MAX_POSITION_TARGET_ERROR_M,
+     MAX_POSITION_TARGET_ERROR_M
+   );
+ 
+   const float limitedPositionErrorY = clampFloat(
+-    rawPositionErrorY,
++    targetNavY_m - positionNavY_m,
+     -MAX_POSITION_TARGET_ERROR_M,
+     MAX_POSITION_TARGET_ERROR_M
+   );
+@@ -3313,22 +3513,22 @@
+     controllerBodyVelocityTargetY_mps
+   );
+ 
+-  const float controllerVelocityX = fusedVelocityInitialized
+-    ? fusedBodyVelocityX_mps
+-    : measuredBodyVelocityX_mps;
+-
+-  const float controllerVelocityY = fusedVelocityInitialized
+-    ? fusedBodyVelocityY_mps
+-    : measuredBodyVelocityY_mps;
+-
++  // Use the direct, quality-gated flow velocity in the fast inner navigation
++  // loop. The ESKF position remains the slow outer-loop reference.
+   const float bodyVelocityErrorX =
+-    controllerBodyVelocityTargetX_mps - controllerVelocityX;
++    controllerBodyVelocityTargetX_mps - measuredBodyVelocityX_mps;
+ 
+   const float bodyVelocityErrorY =
+-    controllerBodyVelocityTargetY_mps - controllerVelocityY;
++    controllerBodyVelocityTargetY_mps - measuredBodyVelocityY_mps;
++
++  float requestedAccelerationX = xyVelocityKp * bodyVelocityErrorX;
++  float requestedAccelerationY = xyVelocityKp * bodyVelocityErrorY;
++  limitVector2(
++    requestedAccelerationX,
++    requestedAccelerationY,
++    MAX_XY_ACCELERATION_MPS2
++  );
+ 
+-  // Acceleration damping is strongest with centered sticks. It produces an
+-  // immediate angle command before optical flow has accumulated velocity.
+   const float stickMagnitude = fmaxf(
+     fabsf(correctedRollStick),
+     fabsf(correctedPitchStick)
+@@ -3354,62 +3554,54 @@
+     MAX_XY_ACCEL_ASSIST_ANGLE_DEG
+   );
+ 
+-    // --------------------------------------------------------------
+-  // CONSERVATIVE FILTERED XY ATTITUDE COMMAND
+-  // --------------------------------------------------------------
+-
+-  // Raw attitude correction requested by the XY velocity controller.
+   const float rawHoldRollAngleDeg = clampFloat(
+-    -xyVelocityKp * bodyVelocityErrorX + rollAccelerationAssistDeg,
++    -atan2f(requestedAccelerationX, STANDARD_GRAVITY_MPS2) *
++      RAD_TO_DEG_F + rollAccelerationAssistDeg,
+     -MAX_XY_CONTROLLER_ANGLE_DEG,
+     MAX_XY_CONTROLLER_ANGLE_DEG
+   );
+ 
+   const float rawHoldPitchAngleDeg = clampFloat(
+-    xyVelocityKp * bodyVelocityErrorY + pitchAccelerationAssistDeg,
++    atan2f(requestedAccelerationY, STANDARD_GRAVITY_MPS2) *
++      RAD_TO_DEG_F + pitchAccelerationAssistDeg,
+     -MAX_XY_CONTROLLER_ANGLE_DEG,
+     MAX_XY_CONTROLLER_ANGLE_DEG
+   );
+ 
+-  // First-order low-pass:
+-  //
+-  // alpha = dt / (tau + dt)
+-  //
+-  // At 200 Hz:
+-  // dt ~= 0.005 s
+-  // tau = 0.10 s
+-  // alpha ~= 0.0476
+-  //
+-  // This prevents one velocity reversal/noisy flow update from immediately
+-  // reversing the commanded aircraft tilt.
+   const float commandFilterAlpha = clampFloat(
+     dt / (XY_COMMAND_FILTER_TAU_S + dt),
+     0.0f,
+     1.0f
+   );
+ 
+-  filteredHoldRollAngleDeg +=
++  const float maximumAngleStep = XY_ANGLE_SLEW_RATE_DPS * dt;
++
++  const float requestedRollStep = clampFloat(
+     commandFilterAlpha *
+-    (rawHoldRollAngleDeg - filteredHoldRollAngleDeg);
++      (rawHoldRollAngleDeg - filteredHoldRollAngleDeg),
++    -maximumAngleStep,
++    maximumAngleStep
++  );
+ 
+-  filteredHoldPitchAngleDeg +=
++  const float requestedPitchStep = clampFloat(
+     commandFilterAlpha *
+-    (rawHoldPitchAngleDeg - filteredHoldPitchAngleDeg);
++      (rawHoldPitchAngleDeg - filteredHoldPitchAngleDeg),
++    -maximumAngleStep,
++    maximumAngleStep
++  );
+ 
+-  // Apply the safety limit again after the filter.
+   filteredHoldRollAngleDeg = clampFloat(
+-    filteredHoldRollAngleDeg,
++    filteredHoldRollAngleDeg + requestedRollStep,
+     -MAX_XY_CONTROLLER_ANGLE_DEG,
+     MAX_XY_CONTROLLER_ANGLE_DEG
+   );
+ 
+   filteredHoldPitchAngleDeg = clampFloat(
+-    filteredHoldPitchAngleDeg,
++    filteredHoldPitchAngleDeg + requestedPitchStep,
+     -MAX_XY_CONTROLLER_ANGLE_DEG,
+     MAX_XY_CONTROLLER_ANGLE_DEG
+   );
+ 
+-  // Preserve your existing smooth XY-hold engagement.
+   const float blend = clampFloat(
+     static_cast<float>(nowMs - xyHoldBlendStartMs) /
+       static_cast<float>(XY_HOLD_BLEND_MS),
+@@ -3417,15 +3609,11 @@
+     1.0f
+   );
+ 
+-  desiredRollAngleDeg =
+-    manualRollAngleDeg +
+-    blend *
+-    (filteredHoldRollAngleDeg - manualRollAngleDeg);
+-
+-  desiredPitchAngleDeg =
+-    manualPitchAngleDeg +
+-    blend *
+-    (filteredHoldPitchAngleDeg - manualPitchAngleDeg);
++  desiredRollAngleDeg = manualRollAngleDeg +
++    blend * (filteredHoldRollAngleDeg - manualRollAngleDeg);
++
++  desiredPitchAngleDeg = manualPitchAngleDeg +
++    blend * (filteredHoldPitchAngleDeg - manualPitchAngleDeg);
+ }
+ 
+ // ================================================================
+@@ -4540,6 +4728,31 @@
+   return false;
+ }
+ 
++void printFlowStatus()
++{
++  runtimeLogf(
++    "FLOWSTAT,COMMISSIONED:%d,MAP:%u,HOLD:%d,GOOD:%d,AXMASK:%X,MOTION:0x%02X,SQUAL:%u,SHUTTER:%u,RAWVX:%.3f,RAWVY:%.3f,FILTVX:%.3f,FILTVY:%.3f,BADTIM:%lu,BADCOUNT:%lu,BADHEIGHT:%lu,BADQUAL:%lu,BADSPEED:%lu,ESTREJ:%lu",
++    xyHoldCommissioned ? 1 : 0,
++    static_cast<unsigned>(flowAxisMap),
++    xyHoldActive ? 1 : 0,
++    lastFlowSampleValid ? 1 : 0,
++    static_cast<unsigned>(lastFlowAxisAcceptedMask),
++    static_cast<unsigned>(lastFlowMotion),
++    static_cast<unsigned>(lastFlowSqual),
++    static_cast<unsigned>(lastFlowShutter),
++    lastInstantFlowVelocityX_mps,
++    lastInstantFlowVelocityY_mps,
++    measuredBodyVelocityX_mps,
++    measuredBodyVelocityY_mps,
++    static_cast<unsigned long>(flowInvalidTimingCount),
++    static_cast<unsigned long>(flowInvalidCountCount),
++    static_cast<unsigned long>(flowInvalidHeightCount),
++    static_cast<unsigned long>(flowInvalidQualityCount),
++    static_cast<unsigned long>(flowInvalidSpeedCount),
++    static_cast<unsigned long>(flowEstimatorRejectCount)
++  );
++}
++
+ void printStatus()
+ {
+   const uint32_t nowMs = millis();
+@@ -4576,6 +4789,9 @@
+     appliedModelCollectiveDshot,
+     measuredYawRateDps
+   );
++
++
++  printFlowStatus();
+ }
+ 
+ void processSerialCommand(char *command)
+@@ -4598,6 +4814,62 @@
+ 
+   if (length == 0) return;
+ 
++  if (strcasecmp(command, "flowstatus") == 0 ||
++      strcasecmp(command, "flow") == 0)
++  {
++    printFlowStatus();
++    return;
++  }
++
++  if (strncasecmp(command, "flowmap ", 8) == 0)
++  {
++    if (flightEnabled || enableRampActive || disableRampActive)
++    {
++      runtimeLogLine("FLOWMAP REJECTED: stop the motors first.");
++      return;
++    }
++
++    const int requestedMap = atoi(command + 8);
++    if (requestedMap < 0 || requestedMap > 7)
++    {
++      runtimeLogLine("FLOWMAP must be 0..7. Run the PMW bench diagnostic first.");
++      return;
++    }
++
++    flowAxisMap = static_cast<FlowAxisMap>(requestedMap);
++    xyHoldCommissioned = false;
++    resetFlightNavigationState(millis());
++    runtimeLogf(
++      "FLOWMAP set to %d. XY commissioning interlock forced OFF.",
++      requestedMap
++    );
++    return;
++  }
++
++  if (strcasecmp(command, "xycommission on") == 0)
++  {
++    if (flightEnabled || enableRampActive || disableRampActive)
++    {
++      runtimeLogLine("XYCOMMISSION ON REJECTED: stop the motors first.");
++      return;
++    }
++
++    xyHoldCommissioned = true;
++    resetFlightNavigationState(millis());
++    runtimeLogLine(
++      "XY HOLD COMMISSIONED: quality/settling gates enabled. Use a tethered test."
++    );
++    return;
++  }
++
++  if (strcasecmp(command, "xycommission off") == 0)
++  {
++    xyHoldCommissioned = false;
++    deactivateXYHold();
++    runtimeLogLine("XY HOLD COMMISSIONING INTERLOCK OFF.");
++    return;
++  }
++
+   if (strcasecmp(command, "pid") == 0 ||
+       strcasecmp(command, "gains") == 0)
+   {
+@@ -5328,14 +5600,14 @@
+   Serial.println(" Hz; DShot/RPM service: 500 Hz.");
+   Serial.println("  VL53L0X ready poll: 50 Hz (20 ms period) on the flight-loop core.");
+   Serial.println("  QMC5883P: 100 Hz on the same I2C bus; ESKF quaternion tilt compensation.");
+-  Serial.println("  FULL HOVER integration: magnetic yaw fusion starts ON automatically.");
+-  Serial.println("  Yaw heading hold arms automatically when the startup ramp completes.");
+-  Serial.println("  Centered sticks hold heading, X/Y position, and altitude once each sensor hold is available.");
++  Serial.println("  Commissioning mode: magnetic yaw fusion starts OFF.");
++  Serial.println("  Yaw heading hold starts OFF; prove yaw separately before enabling it.");
++  Serial.println("  Centered sticks hold heading and altitude; XY remains blocked until bench commissioning.");
+   Serial.println("  Roll/pitch commands move the X/Y target; throttle moves altitude target; yaw release captures heading.");
+   Serial.println("  PMW3901 SPI acquisition: 100 Hz on the opposite core; ESKF correction stays on the flight core.");
+   Serial.println("  RPM stale timeout: 20 ms; smooth motor-model fallback afterward.");
+   Serial.println("  Roll/pitch attitude feedback keeps the proven complementary-loop fallback; EATT remains optional.");
+-  Serial.println("  XY hold: automatic with valid ESKF optical-flow velocity/range; max target 3 deg.");
++  Serial.println("  XY hold: SAFE INTERLOCK OFF until flowmap is bench-verified and xycommission on is issued.");
+   Serial.println("  Altitude hold: automatic ESKF Z/VZ capture at 0.50 m for 300 ms.");
+   Serial.print("  Motion-model feed-forward starts OFF; configured blend motor=");
+   Serial.print(motionModelMotorBlend, 2);
+@@ -5355,6 +5627,7 @@
+   Serial.println("  kp/ki/kd, rkp/rki/rkd, pkp/pki/pkd");
+   Serial.println("  ykp/yki/ykd/yhkp, akp/rakp/pakp");
+   Serial.println("  xyposkp/xyvelkp/xyacckp, zposkp/zvelkp/zvelki");
++  Serial.println("  flow / flowstatus / flowmap 0..7 / xycommission on|off");
+   Serial.println();
+ 
+   printPIDGains();

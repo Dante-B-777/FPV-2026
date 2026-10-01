@@ -1,0 +1,31 @@
+Generated controller validation report
+======================================
+
+Validation scope
+----------------
+1. Fixed-array ESKF host tests:
+   - stationary 20-second propagation with gravity and zero-velocity updates
+   - 8-degree gravity-direction attitude recovery
+   - 0.50 m/s optical-flow body-velocity correction and position integration
+2. Python-model port host tests:
+   - valid hover initialization
+   - positive controller pitch gives rear-pair increase/front-pair decrease
+   - positive controller roll gives right-pair increase/left-pair decrease
+   - settled tilt gives positive collective compensation and near-zero differential
+3. Airframe convention test:
+   - controller roll = negative right-handed body-Y angle
+   - controller pitch = negative right-handed body-X angle
+4. Complete receiver sketch:
+   - C++ syntax compile against local Arduino/ESP32 API stubs
+   - setup() and loop() execution under AddressSanitizer and UndefinedBehaviorSanitizer
+
+Result
+------
+All host validation checks passed. See VALIDATION_OUTPUT.txt for numerical output.
+
+Important boundary
+------------------
+This is not a substitute for an Arduino IDE compile using your installed ESP32
+board package and actual DShotRMT, Bitcraze PMW3901, and Pololu VL53L0X
+libraries. The generated code has not been run on the physical airframe or
+flight-tested. Perform the propeller-off sign and motor tests in README_FIRST.md.

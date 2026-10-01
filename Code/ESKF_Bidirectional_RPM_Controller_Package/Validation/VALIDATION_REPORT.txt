@@ -1,0 +1,57 @@
+Generated bidirectional-DShot controller validation report
+==========================================================
+
+Validation scope
+----------------
+1. Existing fixed-array ESKF host tests:
+   - stationary 20-second propagation with gravity and zero-velocity updates;
+   - 8-degree gravity-direction attitude recovery;
+   - 0.50 m/s optical-flow body-velocity correction and position integration.
+
+2. Existing inverse-dynamics model tests:
+   - positive controller pitch increases the rear pair and decreases the front pair;
+   - positive controller roll increases the right pair and decreases the left pair;
+   - settled tilt produces collective compensation without a false differential.
+
+3. Airframe convention test:
+   - controller roll is negative right-handed body-Y angle;
+   - controller pitch is negative right-handed body-X angle.
+
+4. New RPM/rotor-model tests:
+   - fresh RPM is selected as the known model input;
+   - mechanical RPM is represented as a positive magnitude for all motors;
+   - local omega/DShot scaling learns from valid telemetry;
+   - RPM-derived total thrust is finite and positive;
+   - rear-pair speed increase gives the expected right-handed pitch-torque sign;
+   - right-pair speed increase gives the expected right-handed roll-torque sign;
+   - stale telemetry changes to first-order fallback without an immediate zero-speed jump;
+   - missing telemetry raises the ESKF process-noise scale.
+
+5. Complete receiver source:
+   - C++17 syntax check against local Arduino/ESP-IDF RMT/FreeRTOS API stubs;
+   - GNU C++11 syntax check;
+   - setup() and repeated loop() execution under AddressSanitizer and
+     UndefinedBehaviorSanitizer host stubs.
+
+Result
+------
+All host validation checks passed. See VALIDATION_OUTPUT.txt for numerical output.
+
+Timing architecture checked in source
+-------------------------------------
+- DShot/telemetry service: 500 Hz periodic esp_timer -> dedicated core-0 task.
+- Controller/ESKF: 250 Hz on the Arduino loop path.
+- Coherent four-command buffer: protected by a critical section.
+- RPM snapshot: copied under a separate critical section.
+- No RMT wait or telemetry decoder is called from the 250 Hz controller.
+- Transaction deadline: 1.2 ms inside the 2.0 ms DShot period.
+- RPM loss: 5 consecutive failures.
+- RPM stale timeout: 20 ms.
+
+Important boundary
+------------------
+The host stubs validate structure, syntax, control signs, and pure model logic;
+they do not emulate ESP32 RMT electrical timing or a Bluejay ESC. The final
+Arduino IDE compile must use the installed Arduino-ESP32 3.3.10 board package,
+and the manual-OEN bidirectional DShot path must be verified on the physical
+original ESP32 and 4-in-1 ESC with all propellers removed.

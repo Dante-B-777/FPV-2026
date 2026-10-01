@@ -1,0 +1,36 @@
+kF = 1.4530e-6  hover omega = 874.8 rad/s
+
+[1] Allocator inverts the first-principles forward model
+  PASS  round-trip error negligible over 2000 random wrenches
+
+[2] Torque signs match the physical layout
+  PASS  +tauX (nose up) raises M1,M2 and lowers M3,M4
+  PASS  +tauY (roll right) raises M1,M4 and lowers M2,M3
+  PASS  +tauZ (yaw CCW) raises the CW rotors M2,M4
+
+[3] The OLD mixer had the yaw column inverted
+  PASS  old mixer's positive yawMix yields NEGATIVE tauZ (positive feedback)
+
+[4] Body <-> navigation rotation
+  PASS  navToBody is the exact inverse of bodyToNav
+  PASS  at yaw=+90deg CCW, body +X maps to nav +Y
+  PASS  old form sends body +X to nav -Y (a 180 deg error at 90 deg heading)
+
+[5] Magnetic heading sign
+  PASS  corrected +atan2(right,forward) recovers the true RH heading
+  PASS  old -atan2(...) is wrong by up to 180 deg
+
+[6] IMU mounting transform (180 deg flip about body +Y)
+  PASS  level at rest gives body specific force (0,0,+g)
+  PASS  atan2(-fx, fz) recovers right-handed roll
+  PASS  atan2(fy, fz) recovers right-handed pitch
+
+[7] Tilt required for horizontal acceleration
+  PASS  positive roll accelerates toward +X (right)
+  PASS  forward acceleration commands nose-down (negative) pitch
+
+[8] Optical-flow lever-arm correction sign
+  PASS  corrected lever-arm term recovers zero body velocity
+  PASS  old lever-arm term doubles the error instead of removing it
+
+ALL CHECKS PASSED

@@ -1,0 +1,1083 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Preferences.h>
+#include <math.h>
+
+/*
+  ============================================================================
+  TRANSMITTER FOR Receiver_RotorRate
+  ============================================================================
+
+  Replaces Existing_Transmitter_Compatible.ino.
+
+  WHAT WAS ACTUALLY BROKEN
+
+  The old sketch contained:
+
+      #define YAW_COMMAND 0.0f
+      ...
+      controlData.yaw = YAW_COMMAND;
+
+  Yaw was a compile-time constant zero. No stick was ever read for it and no
+  pin was ever assigned. The receiver's yaw rate controller was being handed
+  0.0 on every packet, forever, so it correctly held heading and correctly
+  refused to turn. No amount of receiver tuning could have changed that.
+
+  Roll, pitch and throttle were read properly, which is exactly why those
+  three axes responded and yaw did not.
+
+  Second problem: RUN_FULL_STICK_CALIBRATION was left at 1, so every power-on
+  spent ~9 s in a blocking calibration whose output had to be copied into
+  source by hand and was otherwise discarded. This build stores calibration in
+  NVS instead, so it survives power cycles and boot is immediate.
+
+  WHAT IS DELIBERATELY UNCHANGED
+
+  - ControlData layout, field order and PACKET_MAGIC. Byte-for-byte identical
+    to the receiver's struct, verified against Receiver_RotorRate.ino.
+  - Receiver MAC 5C:01:3B:BA:CA:EC.
+  - safeOffCommands() still sends throttle = -1.0 when OFF or killed. The
+    receiver treats that as a deliberate off-state sentinel, not a fault.
+  - Throttle remains a CENTRED axis: 0.0 is "hold altitude", not "motors off".
+
+  ============================================================================
+  WIRING NOTE - READ THIS BEFORE FLASHING
+  ============================================================================
+
+  The old sketch used three ADC pins: 35 throttle, 34 roll, 32 pitch. Two
+  2-axis joysticks give four axes, so one axis was wired but never assigned:
+  the horizontal axis of the throttle gimbal. That is the yaw axis.
+
+  YAW_PIN below is set to GPIO 33, the usual companion to 32 and a free ADC1
+  channel on this board. If your yaw pot is on a different pin, do NOT guess:
+  send `pins` over serial and wiggle the yaw stick. The scan prints every free
+  ADC1 channel live, and the one that moves is your pin.
+
+  If you have no fourth axis at all, set HAS_YAW_STICK to 0. Yaw then reverts
+  to a commanded zero, but explicitly and with the reason stated, rather than
+  silently as before.
+*/
+
+// ---------------- PIN SETUP ----------------
+
+#define THROTTLE_PIN        35
+#define ROLL_PIN            34
+#define PITCH_PIN           32
+
+// See the wiring note above. Verify with the `pins` command before flying.
+#define YAW_PIN             33
+
+/*
+  YAW SOURCE
+
+    0  buttons only   - the two joystick pushbuttons, fixed rate  (DEFAULT)
+    1  analog only    - a fourth potentiometer on YAW_PIN
+    2  both           - buttons take priority when pressed
+
+  Mode 0 is the default because it is what this radio is actually wired for
+  and because a fixed commanded rate suits a heading-hold controller better
+  than a proportional stick: releasing the button returns an exact zero, so
+  the receiver's headingHold capture sees a clean stick-inactive edge instead
+  of pot noise hovering near the deadband edge.
+*/
+#define YAW_MODE            0
+
+// Joystick pushbuttons, active LOW with internal pullups.
+// SW on the throttle gimbal was already wired as pin 27. The second gimbal's
+// SW pin was never recorded in the old firmware - verify it with the
+// `buttons` command before flying.
+#define YAW_SW_CCW_PIN      27
+#define YAW_SW_CW_PIN       26
+
+/*
+  Commanded yaw rate while a button is held, as a fraction of the receiver's
+  MAX_YAW_RATE_DPS (90 deg/s). 0.5 gives 45 deg/s, which is a comfortable
+  eight seconds for a full turn and leaves the rate loop plenty of margin.
+*/
+#define YAW_BUTTON_RATE     0.50f
+
+// Slew on the button-driven command, in command units per second. A step
+// straight to 0.5 is within the rate loop's authority, but ramping over
+// ~150 ms keeps the airframe from snapping and keeps the yaw identifier's
+// excitation smooth. Set very high to disable.
+#define YAW_BUTTON_SLEW     3.30f
+
+// Debounce for the yaw buttons, milliseconds. These are held, not clicked,
+// so this only needs to reject contact bounce.
+#define YAW_SW_DEBOUNCE_MS  15
+
+#define KILL_BUTTON_PIN     13
+#define ONOFF_BUTTON_PIN    14
+
+#define ON_LED_PIN          22
+#define OFF_LED_PIN         21
+
+#define YAW_ANALOG_ENABLED  (YAW_MODE == 1 || YAW_MODE == 2)
+#define YAW_BUTTONS_ENABLED (YAW_MODE == 0 || YAW_MODE == 2)
+
+// ---------------- AXIS DIRECTIONS ----------------
+//
+// Throttle, centred:
+//   -1.0 = descend      0.0 = hold altitude      +1.0 = climb
+//
+// Yaw follows the receiver's right-handed convention, which is the whole
+// point of the rebuild:
+//   +1.0 = counter-clockwise seen from above = nose LEFT
+//   -1.0 = clockwise seen from above         = nose RIGHT
+// The receiver scales this by MAX_YAW_RATE_DPS = 90 deg/s.
+//
+// If stick-right turns the nose left, flip YAW_SIGN. That is the only
+// legitimate reason to change it - do not compensate for a receiver-side
+// sign here, or the two layers will fight and mask each other.
+
+#define THROTTLE_SIGN  -1.0f
+#define PITCH_SIGN     -1.0f
+#define ROLL_SIGN      -1.0f
+#define YAW_SIGN       -1.0f
+
+#define DEADZONE 0.10f
+
+// ---------------- ESP-NOW RECEIVER MAC ----------------
+
+uint8_t receiverMacAddress[] = {0x5C, 0x01, 0x3B, 0xBA, 0xCA, 0xEC};
+
+// ---------------- DATA PACKET ----------------
+//
+// MUST match ControlData in Receiver_RotorRate.ino exactly.
+
+#define PACKET_MAGIC 0x44524F4EUL  // "DRON"
+
+typedef struct ControlData {
+  uint32_t magic;
+  uint32_t seq;
+  float throttle;      // -1.0 to +1.0, 0.0 = hold altitude
+  float pitch;         // -1.0 to +1.0
+  float roll;          // -1.0 to +1.0
+  float yaw;           // -1.0 to +1.0, positive = counter-clockwise
+  bool motorsEnabled;
+  bool kill;
+} ControlData;
+
+ControlData controlData;
+esp_now_peer_info_t peerInfo;
+
+uint32_t packetSeq = 0;
+
+// ---------------- CALIBRATION STORAGE ----------------
+
+struct AxisCalibration
+{
+  int minimum;
+  int center;
+  int maximum;
+};
+
+AxisCalibration throttleCal = {0, 1902, 4095};
+AxisCalibration rollCal     = {0, 1864, 4095};
+AxisCalibration pitchCal    = {0, 1900, 4095};
+AxisCalibration yawCal      = {0, 1900, 4095};
+
+Preferences preferences;
+
+static const char *PREFS_NAMESPACE = "txcal";
+static const uint32_t CALIBRATION_VERSION = 2;
+
+bool calibrationValid = false;
+
+// ---------------- STATE ----------------
+
+bool motorsEnabled = false;
+bool killActive = false;
+
+bool prevOnOffPressed = false;
+bool prevKillPressed = false;
+
+volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_FAIL;
+
+uint32_t sendOkCount = 0;
+uint32_t sendFailCount = 0;
+
+unsigned long lastPrintMs = 0;
+const unsigned long PRINT_PERIOD_MS = 200;
+
+unsigned long lastSendMs = 0;
+const unsigned long SEND_PERIOD_MS = 20;
+
+unsigned long lastBlinkMs = 0;
+const unsigned long KILL_BLINK_PERIOD_MS = 250;
+bool offLedBlinkState = false;
+
+bool verbosePrint = false;
+
+// ---------------- HELPERS ----------------
+
+float clampFloat(float value, float low, float high)
+{
+  if (value > high) return high;
+  if (value < low) return low;
+  return value;
+}
+
+float applyDeadzoneAndRescale(float value)
+{
+  if (fabsf(value) < DEADZONE) return 0.0f;
+
+  if (value > 0.0f) value = (value - DEADZONE) / (1.0f - DEADZONE);
+  else              value = (value + DEADZONE) / (1.0f - DEADZONE);
+
+  return clampFloat(value, -1.0f, 1.0f);
+}
+
+float normalizeAxis(int raw, const AxisCalibration &cal)
+{
+  // A centre pinned against either end means the axis was never calibrated
+  // or the pot is disconnected. Returning 0 is the safe interpretation.
+  if (cal.center <= cal.minimum + 10 || cal.center >= cal.maximum - 10)
+  {
+    return 0.0f;
+  }
+
+  float value;
+
+  if (raw >= cal.center)
+  {
+    value = (float)(raw - cal.center) / (float)(cal.maximum - cal.center);
+  }
+  else
+  {
+    value = (float)(raw - cal.center) / (float)(cal.center - cal.minimum);
+  }
+
+  value = clampFloat(value, -1.0f, 1.0f);
+  return applyDeadzoneAndRescale(value);
+}
+
+/*
+  ============================================================================
+  BUTTON-DRIVEN YAW
+  ============================================================================
+
+  Two held pushbuttons produce a fixed yaw rate command:
+
+      CCW button held  ->  +YAW_BUTTON_RATE   (nose left)
+      CW  button held  ->  -YAW_BUTTON_RATE   (nose right)
+      both or neither  ->   0
+
+  "Both" resolving to zero is deliberate rather than last-press-wins. If a
+  button sticks closed, the failure is a dead yaw axis the pilot notices
+  immediately, not a continuous unattended rotation.
+
+  Debouncing is per-button and level-based, since these are held rather than
+  clicked. The output is then slew-limited so releasing does not step the
+  commanded rate discontinuously.
+*/
+struct DebouncedButton
+{
+  uint8_t pin = 0;
+  bool stable = false;
+  bool lastRead = false;
+  unsigned long lastChangeMs = 0;
+
+  void begin(uint8_t pinNumber)
+  {
+    pin = pinNumber;
+    pinMode(pin, INPUT_PULLUP);
+    stable = false;
+    lastRead = false;
+    lastChangeMs = millis();
+  }
+
+  // Returns the debounced pressed state. Active LOW.
+  bool update(unsigned long nowMs)
+  {
+    const bool raw = (digitalRead(pin) == LOW);
+
+    if (raw != lastRead)
+    {
+      lastRead = raw;
+      lastChangeMs = nowMs;
+    }
+    else if (nowMs - lastChangeMs >= YAW_SW_DEBOUNCE_MS)
+    {
+      stable = raw;
+    }
+
+    return stable;
+  }
+};
+
+DebouncedButton yawCcwButton;
+DebouncedButton yawCwButton;
+
+float yawButtonCommand = 0.0f;
+unsigned long lastYawUpdateMs = 0;
+
+bool yawCcwHeld = false;
+bool yawCwHeld = false;
+
+float updateButtonYaw(unsigned long nowMs)
+{
+#if !YAW_BUTTONS_ENABLED
+  (void)nowMs;
+  return 0.0f;
+#else
+  yawCcwHeld = yawCcwButton.update(nowMs);
+  yawCwHeld  = yawCwButton.update(nowMs);
+
+  float target = 0.0f;
+
+  if (yawCcwHeld && !yawCwHeld)      target = +YAW_BUTTON_RATE;
+  else if (yawCwHeld && !yawCcwHeld) target = -YAW_BUTTON_RATE;
+  else                               target = 0.0f;
+
+  // Slew toward the target using real elapsed time, so the ramp does not
+  // depend on loop rate.
+  float dt = (float)(nowMs - lastYawUpdateMs) * 0.001f;
+  lastYawUpdateMs = nowMs;
+
+  dt = clampFloat(dt, 0.0f, 0.10f);
+
+  const float maximumStep = YAW_BUTTON_SLEW * dt;
+  const float error = target - yawButtonCommand;
+
+  if (error > maximumStep)       yawButtonCommand += maximumStep;
+  else if (error < -maximumStep) yawButtonCommand -= maximumStep;
+  else                           yawButtonCommand = target;
+
+  return clampFloat(yawButtonCommand, -1.0f, 1.0f);
+#endif
+}
+
+void safeOffCommands()
+{
+  // throttle 0.0 means "hold altitude", so OFF must send -1.0 to be
+  // unambiguously below any hover command. The receiver expects exactly this.
+  controlData.throttle = -1.0f;
+  controlData.pitch = 0.0f;
+  controlData.roll = 0.0f;
+  controlData.yaw = 0.0f;
+
+  // Drop the slewed button command too, so re-enabling with a button still
+  // held ramps up from zero rather than resuming mid-turn.
+  yawButtonCommand = 0.0f;
+}
+
+// ---------------- NVS PERSISTENCE ----------------
+
+void saveCalibration()
+{
+  preferences.begin(PREFS_NAMESPACE, false);
+
+  preferences.putUInt("ver", CALIBRATION_VERSION);
+
+  preferences.putInt("tmin", throttleCal.minimum);
+  preferences.putInt("tctr", throttleCal.center);
+  preferences.putInt("tmax", throttleCal.maximum);
+
+  preferences.putInt("rmin", rollCal.minimum);
+  preferences.putInt("rctr", rollCal.center);
+  preferences.putInt("rmax", rollCal.maximum);
+
+  preferences.putInt("pmin", pitchCal.minimum);
+  preferences.putInt("pctr", pitchCal.center);
+  preferences.putInt("pmax", pitchCal.maximum);
+
+  preferences.putInt("ymin", yawCal.minimum);
+  preferences.putInt("yctr", yawCal.center);
+  preferences.putInt("ymax", yawCal.maximum);
+
+  preferences.end();
+
+  Serial.println("Calibration saved to NVS. It will persist across reboots.");
+}
+
+bool loadCalibration()
+{
+  preferences.begin(PREFS_NAMESPACE, true);
+
+  const uint32_t version = preferences.getUInt("ver", 0);
+
+  if (version != CALIBRATION_VERSION)
+  {
+    preferences.end();
+    return false;
+  }
+
+  throttleCal.minimum = preferences.getInt("tmin", 0);
+  throttleCal.center  = preferences.getInt("tctr", 1902);
+  throttleCal.maximum = preferences.getInt("tmax", 4095);
+
+  rollCal.minimum = preferences.getInt("rmin", 0);
+  rollCal.center  = preferences.getInt("rctr", 1864);
+  rollCal.maximum = preferences.getInt("rmax", 4095);
+
+  pitchCal.minimum = preferences.getInt("pmin", 0);
+  pitchCal.center  = preferences.getInt("pctr", 1900);
+  pitchCal.maximum = preferences.getInt("pmax", 4095);
+
+  yawCal.minimum = preferences.getInt("ymin", 0);
+  yawCal.center  = preferences.getInt("yctr", 1900);
+  yawCal.maximum = preferences.getInt("ymax", 4095);
+
+  preferences.end();
+  return true;
+}
+
+void clearCalibration()
+{
+  preferences.begin(PREFS_NAMESPACE, false);
+  preferences.clear();
+  preferences.end();
+  Serial.println("Stored calibration cleared. Run `calibrate`.");
+}
+
+// ---------------- CALIBRATION ----------------
+
+void printCalibration()
+{
+  Serial.println();
+  Serial.println("Axis        min    center    max     span");
+
+  const AxisCalibration *axes[4] =
+    {&throttleCal, &rollCal, &pitchCal, &yawCal};
+  const char *names[4] = {"throttle", "roll    ", "pitch   ", "yaw     "};
+
+  for (int i = 0; i < 4; i++)
+  {
+    Serial.printf("%s  %5d   %5d   %5d   %5d\n",
+      names[i],
+      axes[i]->minimum,
+      axes[i]->center,
+      axes[i]->maximum,
+      axes[i]->maximum - axes[i]->minimum);
+  }
+
+  Serial.println();
+
+#if YAW_BUTTONS_ENABLED
+  Serial.printf(
+    "Yaw buttons ENABLED: CCW/left on GPIO %d, CW/right on GPIO %d\n",
+    YAW_SW_CCW_PIN, YAW_SW_CW_PIN);
+  Serial.printf(
+    "  held rate %.2f  ->  %.0f deg/s at the receiver\n",
+    YAW_BUTTON_RATE, YAW_BUTTON_RATE * 90.0f);
+#endif
+
+#if YAW_ANALOG_ENABLED
+  Serial.printf("Yaw analog ENABLED on GPIO %d\n", YAW_PIN);
+#endif
+
+#if YAW_MODE == 0
+  Serial.println("Yaw analog disabled (YAW_MODE 0) - buttons only.");
+#endif
+
+  Serial.println();
+}
+
+/*
+  A span far below the usable ADC range means the stick was not moved through
+  its full travel during step 2. Flying on that produces an axis that saturates
+  at a fraction of stick deflection, so it is worth refusing loudly.
+*/
+bool calibrationLooksSane()
+{
+  const AxisCalibration *axes[4] =
+    {&throttleCal, &rollCal, &pitchCal, &yawCal};
+  const char *names[4] = {"throttle", "roll", "pitch", "yaw"};
+
+  bool sane = true;
+
+  for (int i = 0; i < 4; i++)
+  {
+#if !YAW_ANALOG_ENABLED
+    if (i == 3) continue;
+#endif
+
+    const int span = axes[i]->maximum - axes[i]->minimum;
+
+    if (span < 1500)
+    {
+      Serial.printf(
+        "WARNING: %s span is only %d counts. Stick was probably not moved "
+        "through full travel.\n", names[i], span);
+      sane = false;
+    }
+
+    if (axes[i]->center <= axes[i]->minimum + 10 ||
+        axes[i]->center >= axes[i]->maximum - 10)
+    {
+      Serial.printf(
+        "WARNING: %s centre sits at the end of its range. That axis will "
+        "read a constant 0.\n", names[i]);
+      sane = false;
+    }
+  }
+
+  return sane;
+}
+
+void calibrateSticks()
+{
+  Serial.println();
+  Serial.println("=== JOYSTICK CALIBRATION ===");
+  Serial.println();
+  Serial.println("Step 1 of 2: leave ALL sticks centred and hands off.");
+  Serial.println("Starting in 2 seconds...");
+  delay(2000);
+
+  const int centerSamples = 800;
+
+  long sums[4] = {0, 0, 0, 0};
+  int noiseMin[4] = {4095, 4095, 4095, 4095};
+  int noiseMax[4] = {0, 0, 0, 0};
+
+  const int pins[4] = {THROTTLE_PIN, ROLL_PIN, PITCH_PIN, YAW_PIN};
+
+  for (int i = 0; i < centerSamples; i++)
+  {
+    for (int a = 0; a < 4; a++)
+    {
+      const int v = analogRead(pins[a]);
+      sums[a] += v;
+      if (v < noiseMin[a]) noiseMin[a] = v;
+      if (v > noiseMax[a]) noiseMax[a] = v;
+    }
+    delay(2);
+  }
+
+  AxisCalibration *axes[4] = {&throttleCal, &rollCal, &pitchCal, &yawCal};
+  const char *names[4] = {"throttle", "roll", "pitch", "yaw"};
+
+  for (int a = 0; a < 4; a++)
+  {
+    axes[a]->center  = sums[a] / centerSamples;
+    axes[a]->minimum = axes[a]->center;
+    axes[a]->maximum = axes[a]->center;
+
+    Serial.printf("%-9s centre %4d   (noise %d to %d)\n",
+      names[a], axes[a]->center, noiseMin[a], noiseMax[a]);
+  }
+
+  Serial.println();
+  Serial.println("Step 2 of 2: move EVERY stick through its FULL travel.");
+  Serial.println("  throttle: full down and full up");
+  Serial.println("  roll:     full left and full right");
+  Serial.println("  pitch:    full forward and full back");
+#if YAW_ANALOG_ENABLED
+  Serial.println("  yaw:      full left and full right");
+#endif
+  Serial.println("Keep moving for 8 seconds. Starting now.");
+
+  const unsigned long startMs = millis();
+
+  while (millis() - startMs < 8000)
+  {
+    for (int a = 0; a < 4; a++)
+    {
+      const int v = analogRead(pins[a]);
+      if (v < axes[a]->minimum) axes[a]->minimum = v;
+      if (v > axes[a]->maximum) axes[a]->maximum = v;
+    }
+    delay(2);
+  }
+
+  Serial.println();
+  Serial.println("Calibration complete.");
+  printCalibration();
+
+  if (calibrationLooksSane())
+  {
+    Serial.println("All axes look sane.");
+  }
+  else
+  {
+    Serial.println("Fix the warnings above and run `calibrate` again.");
+  }
+
+  saveCalibration();
+  calibrationValid = true;
+}
+
+/*
+  Live scan of every free ADC1 channel.
+
+  This exists because the yaw pot's pin is the one piece of information the
+  old firmware never recorded - it read three axes and hardcoded the fourth.
+  Rather than guess and hope, wiggle the stick and watch which column moves.
+*/
+void scanAdcPins()
+{
+  const int candidates[] = {33, 36, 39, 32, 34, 35};
+  const int count = sizeof(candidates) / sizeof(candidates[0]);
+
+  Serial.println();
+  Serial.println("ADC1 pin scan. Move the YAW stick and watch which column");
+  Serial.println("changes. That is your YAW_PIN. Runs for 15 seconds.");
+  Serial.println();
+
+  Serial.print("      ");
+  for (int i = 0; i < count; i++) Serial.printf("GPIO%-2d  ", candidates[i]);
+  Serial.println();
+
+  const unsigned long startMs = millis();
+
+  while (millis() - startMs < 15000)
+  {
+    Serial.print("      ");
+    for (int i = 0; i < count; i++)
+    {
+      Serial.printf("%5d   ", analogRead(candidates[i]));
+    }
+    Serial.println();
+    delay(150);
+  }
+
+  Serial.println();
+  Serial.println("Scan finished. Set YAW_PIN to the pin that moved, reflash,");
+  Serial.println("then run `calibrate`.");
+  Serial.println();
+}
+
+/*
+  Live scan of candidate digital pins for the joystick pushbuttons.
+
+  Same reason as scanAdcPins(): the old firmware defined THROTTLE_SW_PIN 27
+  but never read it, and never mentioned the second gimbal's SW at all. Press
+  each stick and watch which pin drops to 0.
+
+  Every candidate is pulled up here, so an unconnected pin reads a steady 1
+  and a wired-but-unpressed button also reads 1. Only a press produces a 0.
+*/
+void scanButtonPins()
+{
+  const int candidates[] = {27, 26, 25, 15, 4, 16, 17, 5, 18, 19, 23};
+  const int count = sizeof(candidates) / sizeof(candidates[0]);
+
+  for (int i = 0; i < count; i++)
+  {
+    if (candidates[i] == KILL_BUTTON_PIN) continue;
+    if (candidates[i] == ONOFF_BUTTON_PIN) continue;
+    pinMode(candidates[i], INPUT_PULLUP);
+  }
+
+  Serial.println();
+  Serial.println("Digital pin scan. PRESS each joystick stick straight down");
+  Serial.println("and watch which column goes to 0. Runs for 20 seconds.");
+  Serial.println("A pin that is always 0 is shorted, not a button.");
+  Serial.println();
+
+  Serial.print("  ");
+  for (int i = 0; i < count; i++) Serial.printf("%3d ", candidates[i]);
+  Serial.println("   <- GPIO");
+
+  const unsigned long startMs = millis();
+
+  while (millis() - startMs < 20000)
+  {
+    Serial.print("  ");
+    for (int i = 0; i < count; i++)
+    {
+      Serial.printf("%3d ", digitalRead(candidates[i]) == LOW ? 0 : 1);
+    }
+    Serial.println();
+    delay(150);
+  }
+
+  // Leave the two real yaw buttons configured; the rest are harmless as
+  // pulled-up inputs.
+  yawCcwButton.begin(YAW_SW_CCW_PIN);
+  yawCwButton.begin(YAW_SW_CW_PIN);
+
+  Serial.println();
+  Serial.println("Scan finished. Set YAW_SW_CCW_PIN and YAW_SW_CW_PIN to the");
+  Serial.println("two pins that went to 0, then reflash.");
+  Serial.println();
+}
+
+// ---------------- SERIAL COMMANDS ----------------
+
+void printHelp()
+{
+  Serial.println();
+  Serial.println("Commands:");
+  Serial.println("  help       this list");
+  Serial.println("  calibrate  run stick calibration and save to NVS");
+  Serial.println("  show       print stored calibration");
+  Serial.println("  clear      erase stored calibration");
+  Serial.println("  pins       live ADC1 scan to find the yaw pot's pin");
+  Serial.println("  buttons    live digital scan to find the joystick SW pins");
+  Serial.println("  link       ESP-NOW delivery statistics");
+  Serial.println("  verbose    toggle full raw/centre/min-max debug output");
+  Serial.println();
+}
+
+void printLinkStats()
+{
+  const uint32_t total = sendOkCount + sendFailCount;
+  const float rate = (total > 0)
+    ? (100.0f * (float)sendOkCount / (float)total)
+    : 0.0f;
+
+  Serial.println();
+  Serial.printf("Packets sent      : %lu\n", (unsigned long)total);
+  Serial.printf("Delivered         : %lu\n", (unsigned long)sendOkCount);
+  Serial.printf("Failed            : %lu\n", (unsigned long)sendFailCount);
+  Serial.printf("Delivery rate     : %.1f %%\n", rate);
+  Serial.printf("Receiver MAC      : 5C:01:3B:BA:CA:EC\n");
+  Serial.println();
+}
+
+void handleSerial()
+{
+  static char buffer[32];
+  static size_t length = 0;
+
+  while (Serial.available() > 0)
+  {
+    const char c = (char)Serial.read();
+
+    if (c == '\r') continue;
+
+    if (c == '\n')
+    {
+      buffer[length] = '\0';
+
+      if (length > 0)
+      {
+        if      (strcmp(buffer, "help") == 0)      printHelp();
+        else if (strcmp(buffer, "calibrate") == 0) calibrateSticks();
+        else if (strcmp(buffer, "show") == 0)      printCalibration();
+        else if (strcmp(buffer, "clear") == 0)     clearCalibration();
+        else if (strcmp(buffer, "pins") == 0)      scanAdcPins();
+        else if (strcmp(buffer, "buttons") == 0)   scanButtonPins();
+        else if (strcmp(buffer, "link") == 0)      printLinkStats();
+        else if (strcmp(buffer, "verbose") == 0)
+        {
+          verbosePrint = !verbosePrint;
+          Serial.printf("verbose %s\n", verbosePrint ? "on" : "off");
+        }
+        else
+        {
+          Serial.printf("Unknown command '%s'. Try `help`.\n", buffer);
+        }
+      }
+
+      length = 0;
+      continue;
+    }
+
+    if (length < sizeof(buffer) - 1) buffer[length++] = c;
+  }
+}
+
+// ---------------- BUTTONS AND LEDS ----------------
+
+DebouncedButton onOffButton;
+DebouncedButton killButton;
+
+/*
+  ON/OFF and KILL are edge-triggered and were previously read with a bare
+  digitalRead, with no debouncing at all. One physical press on a bouncy
+  contact registers as several edges, and because ON/OFF *toggles*, an even
+  number of edges leaves the state unchanged while an odd number flips it -
+  so a single press could arm, disarm, and re-arm the aircraft.
+
+  These are now debounced on the same 15 ms filter as the yaw buttons.
+*/
+void updateButtons()
+{
+  const unsigned long nowMs = millis();
+
+  const bool onOffPressed = onOffButton.update(nowMs);
+  const bool killPressed  = killButton.update(nowMs);
+
+  const bool onOffJustPressed = onOffPressed && !prevOnOffPressed;
+  const bool killJustPressed  = killPressed && !prevKillPressed;
+
+  if (killJustPressed)
+  {
+    killActive = true;
+    motorsEnabled = false;
+    Serial.println("KILL pressed - motors disabled.");
+  }
+
+  if (onOffJustPressed)
+  {
+    if (killActive)
+    {
+      killActive = false;
+      motorsEnabled = true;
+    }
+    else
+    {
+      motorsEnabled = !motorsEnabled;
+    }
+
+    Serial.printf("ON/OFF pressed - motors %s.\n",
+      motorsEnabled ? "ENABLED" : "disabled");
+  }
+
+  prevOnOffPressed = onOffPressed;
+  prevKillPressed = killPressed;
+}
+
+void updateLEDs()
+{
+  const unsigned long nowMs = millis();
+
+  if (killActive)
+  {
+    digitalWrite(ON_LED_PIN, LOW);
+
+    if (nowMs - lastBlinkMs >= KILL_BLINK_PERIOD_MS)
+    {
+      lastBlinkMs = nowMs;
+      offLedBlinkState = !offLedBlinkState;
+    }
+
+    digitalWrite(OFF_LED_PIN, offLedBlinkState ? HIGH : LOW);
+  }
+  else if (motorsEnabled)
+  {
+    digitalWrite(ON_LED_PIN, HIGH);
+    digitalWrite(OFF_LED_PIN, LOW);
+  }
+  else
+  {
+    digitalWrite(ON_LED_PIN, LOW);
+    digitalWrite(OFF_LED_PIN, HIGH);
+  }
+}
+
+// ---------------- ESP-NOW CALLBACK ----------------
+
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status)
+{
+  lastSendStatus = status;
+
+  if (status == ESP_NOW_SEND_SUCCESS) sendOkCount++;
+  else                                sendFailCount++;
+}
+
+// ---------------- SETUP ----------------
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  onOffButton.begin(ONOFF_BUTTON_PIN);
+  killButton.begin(KILL_BUTTON_PIN);
+
+  yawCcwButton.begin(YAW_SW_CCW_PIN);
+  yawCwButton.begin(YAW_SW_CW_PIN);
+  lastYawUpdateMs = millis();
+
+  pinMode(ON_LED_PIN, OUTPUT);
+  pinMode(OFF_LED_PIN, OUTPUT);
+
+  digitalWrite(ON_LED_PIN, LOW);
+  digitalWrite(OFF_LED_PIN, HIGH);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println(" Transmitter for Receiver_RotorRate");
+  Serial.println("========================================");
+
+  calibrationValid = loadCalibration();
+
+  if (calibrationValid)
+  {
+    Serial.println("Loaded stored calibration from NVS.");
+    printCalibration();
+  }
+  else
+  {
+    Serial.println();
+    Serial.println("NO STORED CALIBRATION FOUND.");
+    Serial.println("Using built-in defaults. Yaw in particular has never");
+    Serial.println("been calibrated on this radio, because the old firmware");
+    Serial.println("never read a yaw axis at all.");
+    Serial.println();
+    Serial.println("Type `calibrate` to fix this, or `pins` first if you are");
+    Serial.println("not certain which GPIO the yaw pot is on.");
+    printCalibration();
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(300);
+
+  // WiFi.macAddress() returns all zeros on some core versions before the
+  // driver is fully up. Ask the driver directly instead.
+  uint8_t selfMac[6] = {};
+  esp_wifi_get_mac(WIFI_IF_STA, selfMac);
+
+  Serial.printf("Transmitter MAC : %02X:%02X:%02X:%02X:%02X:%02X\n",
+    selfMac[0], selfMac[1], selfMac[2],
+    selfMac[3], selfMac[4], selfMac[5]);
+
+  Serial.println("Receiver MAC    : 5C:01:3B:BA:CA:EC");
+  Serial.printf("Packet size     : %u bytes\n",
+    (unsigned)sizeof(ControlData));
+
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("FATAL: esp_now_init failed.");
+
+    while (true)
+    {
+      digitalWrite(ON_LED_PIN, LOW);
+      digitalWrite(OFF_LED_PIN, HIGH);
+      delay(100);
+    }
+  }
+
+  esp_now_register_send_cb(onDataSent);
+
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, receiverMacAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK)
+  {
+    Serial.println("FATAL: failed to add receiver peer.");
+
+    while (true)
+    {
+      digitalWrite(ON_LED_PIN, LOW);
+      digitalWrite(OFF_LED_PIN, HIGH);
+      delay(100);
+    }
+  }
+
+  motorsEnabled = false;
+  killActive = false;
+
+  safeOffCommands();
+  controlData.magic = PACKET_MAGIC;
+  controlData.seq = 0;
+  controlData.motorsEnabled = false;
+  controlData.kill = false;
+
+  Serial.println("Peer added. Starting in OFF state.");
+  printHelp();
+}
+
+// ---------------- LOOP ----------------
+
+void loop()
+{
+  const unsigned long nowMs = millis();
+
+  handleSerial();
+  updateButtons();
+  updateLEDs();
+
+  /*
+    Poll the yaw buttons every pass, not once per packet. The send gate only
+    opens every 20 ms, which is close enough to YAW_SW_DEBOUNCE_MS that
+    debouncing at that rate would alias contact bounce instead of rejecting
+    it. Polling here also makes the slew ramp smooth rather than stepped.
+  */
+  const float buttonYaw = updateButtonYaw(nowMs);
+
+  if (nowMs - lastSendMs < SEND_PERIOD_MS) return;
+
+  lastSendMs = nowMs;
+
+  const int throttleRaw = analogRead(THROTTLE_PIN);
+  const int rollRaw     = analogRead(ROLL_PIN);
+  const int pitchRaw    = analogRead(PITCH_PIN);
+
+#if YAW_ANALOG_ENABLED
+  const int yawRaw = analogRead(YAW_PIN);
+#else
+  const int yawRaw = yawCal.center;
+#endif
+
+  float throttleCmd = normalizeAxis(throttleRaw, throttleCal) * THROTTLE_SIGN;
+  float rollCmd     = normalizeAxis(rollRaw, rollCal) * ROLL_SIGN;
+  float pitchCmd    = normalizeAxis(pitchRaw, pitchCal) * PITCH_SIGN;
+
+  /*
+    Yaw command assembly.
+
+    In mode 2 the buttons win whenever either is held. Summing the two
+    sources instead would let a slightly off-centre pot bias the fixed rate,
+    which defeats the point of having a fixed rate at all.
+  */
+#if YAW_MODE == 0
+  float yawCmd = buttonYaw;
+#elif YAW_MODE == 1
+  (void)buttonYaw;
+  float yawCmd = normalizeAxis(yawRaw, yawCal) * YAW_SIGN;
+#else
+  const float yawAnalog = normalizeAxis(yawRaw, yawCal) * YAW_SIGN;
+  float yawCmd = (fabsf(buttonYaw) > 0.001f) ? buttonYaw : yawAnalog;
+#endif
+
+  throttleCmd = clampFloat(throttleCmd, -1.0f, 1.0f);
+  rollCmd     = clampFloat(rollCmd, -1.0f, 1.0f);
+  pitchCmd    = clampFloat(pitchCmd, -1.0f, 1.0f);
+  yawCmd      = clampFloat(yawCmd, -1.0f, 1.0f);
+
+  controlData.magic = PACKET_MAGIC;
+  controlData.seq = packetSeq++;
+
+  controlData.motorsEnabled = motorsEnabled;
+  controlData.kill = killActive;
+
+  if (motorsEnabled && !killActive)
+  {
+    controlData.throttle = throttleCmd;
+    controlData.pitch = pitchCmd;
+    controlData.roll = rollCmd;
+    controlData.yaw = yawCmd;
+  }
+  else
+  {
+    safeOffCommands();
+  }
+
+  const esp_err_t result = esp_now_send(
+    receiverMacAddress,
+    (uint8_t *)&controlData,
+    sizeof(controlData)
+  );
+
+  if (nowMs - lastPrintMs < PRINT_PERIOD_MS) return;
+
+  lastPrintMs = nowMs;
+
+  if (verbosePrint)
+  {
+    Serial.printf(
+      "RAW T:%4d P:%4d R:%4d Y:%4d | CTR T:%4d P:%4d R:%4d Y:%4d | ",
+      throttleRaw, pitchRaw, rollRaw, yawRaw,
+      throttleCal.center, pitchCal.center, rollCal.center, yawCal.center);
+  }
+
+  Serial.printf(
+    "CMD T:%+.3f P:%+.3f R:%+.3f Y:%+.3f | YSW:%s | EN:%d KILL:%d | "
+    "SEQ:%lu | SEND:%s DELIVERY:%s\n",
+    controlData.throttle,
+    controlData.pitch,
+    controlData.roll,
+    controlData.yaw,
+    (yawCcwHeld && yawCwHeld) ? "BOTH"
+      : yawCcwHeld ? "CCW "
+      : yawCwHeld  ? "CW  "
+      : "--  ",
+    controlData.motorsEnabled ? 1 : 0,
+    controlData.kill ? 1 : 0,
+    (unsigned long)controlData.seq,
+    result == ESP_OK ? "OK" : "FAIL",
+    lastSendStatus == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+}
