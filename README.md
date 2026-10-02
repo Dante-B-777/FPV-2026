@@ -95,7 +95,7 @@ a host-side test suite that compiles with stubbed Arduino/ESP-IDF headers — no
 hardware required:
 
 ```bash
-cd Code/Rotor_Rate_Controller_Package/Validation && ./run_host_validation.sh
+cd Code/ESKF_Bidirectional_RPM_Controller_Package/Validation && ./run_host_validation.sh
 ```
 
 Figures and the paper regenerate from the logs:
